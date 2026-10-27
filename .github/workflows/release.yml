@@ -1,0 +1,221 @@
+name: Release Linux shared library
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and upload (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.event.inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish Linux .so
+    # Ubuntu 22.04 keeps the glibc baseline older than ubuntu-latest (24.04),
+    # so the resulting shared library loads on more CPA hosts.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_TAG"
+          echo "TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - name: Run tests
+        run: CGO_ENABLED=0 go test ./...
+
+      - name: Build Linux .so (amd64 + arm64)
+        run: |
+          set -euo pipefail
+          mkdir -p dist/plugins/linux/amd64 dist/plugins/linux/arm64
+
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 CC=gcc \
+            go build -buildmode=c-shared -trimpath -ldflags='-s -w' \
+            -o dist/plugins/linux/amd64/raccoon2api.so .
+
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc \
+            go build -buildmode=c-shared -trimpath -ldflags='-s -w' \
+            -o dist/plugins/linux/arm64/raccoon2api.so .
+
+          rm -f dist/plugins/linux/*/raccoon2api.h
+
+          for so in dist/plugins/linux/*/raccoon2api.so; do
+            echo "== $so"
+            file "$so"
+          done
+
+          # Do not use grep -q with pipefail: grep may close the pipe early and
+          # make nm die with SIGPIPE even though the symbol is present.
+          nm -D --defined-only dist/plugins/linux/amd64/raccoon2api.so \
+            | grep -E 'cliproxyPlugin(Call|Free|Shutdown)$' >/dev/null
+          aarch64-linux-gnu-nm -D --defined-only dist/plugins/linux/arm64/raccoon2api.so \
+            | grep -E 'cliproxyPlugin(Call|Free|Shutdown)$' >/dev/null
+
+      - name: Package release assets
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          VERSION="${VERSION//\//-}"
+          test -n "$VERSION"
+
+          PLUGIN_VERSION=$(sed -n 's/.*pluginVersion = "\([^"]*\)".*/\1/p' schema.go | head -1)
+          if [ -n "$PLUGIN_VERSION" ] && [ "$PLUGIN_VERSION" != "$VERSION" ]; then
+            echo "::warning::tag $TAG does not match pluginVersion $PLUGIN_VERSION"
+          fi
+
+          STAGE="dist/stage/raccoon2api-$VERSION"
+          rm -rf "$STAGE" dist/release
+          mkdir -p "$STAGE/plugins/linux/amd64" "$STAGE/plugins/linux/arm64" dist/release
+
+          cp dist/plugins/linux/amd64/raccoon2api.so "$STAGE/plugins/linux/amd64/"
+          cp dist/plugins/linux/arm64/raccoon2api.so "$STAGE/plugins/linux/arm64/"
+          cp README.md config.example.yaml "$STAGE/"
+          if [ -f LICENSE ]; then
+            cp LICENSE "$STAGE/"
+          fi
+
+          (
+            cd "$STAGE"
+            find . -type f ! -name SHA256SUMS -print0 \
+              | sort -z \
+              | xargs -0 sha256sum > SHA256SUMS
+          )
+
+          cp dist/plugins/linux/amd64/raccoon2api.so "dist/release/raccoon2api-$VERSION-linux-amd64.so"
+          cp dist/plugins/linux/arm64/raccoon2api.so "dist/release/raccoon2api-$VERSION-linux-arm64.so"
+          tar -C dist/stage -czf "dist/release/raccoon2api-$VERSION-linux.tar.gz" "raccoon2api-$VERSION"
+
+          (
+            cd dist/release
+            sha256sum ./*.so ./*.tar.gz > SHA256SUMS
+          )
+          ls -lh dist/release
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: raccoon2api-${{ github.event.release.tag_name || github.event.inputs.tag }}-linux
+          path: dist/release/*
+          if-no-files-found: error
+
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOTES="dist/release/RELEASE_NOTES.md"
+
+          if ! gh api --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+              -f tag_name="$TAG" \
+              --jq .body > "$NOTES"; then
+            echo "::warning::GitHub generate-notes failed; falling back to git log"
+            PREV=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+            if [ -n "$PREV" ]; then
+              git log --no-merges --pretty='- %s (%h)' "${PREV}..${TAG}" > "$NOTES"
+            else
+              git log --no-merges --pretty='- %s (%h)' "$TAG" > "$NOTES"
+            fi
+          fi
+
+          if [ ! -s "$NOTES" ] || [ "$(cat "$NOTES")" = "null" ]; then
+            echo "No changes recorded for $TAG." > "$NOTES"
+          fi
+
+          {
+            echo "## 更新内容"
+            echo
+            cat "$NOTES"
+          } > "$NOTES.tmp"
+          mv "$NOTES.tmp" "$NOTES"
+          cat "$NOTES"
+
+      - name: Fill empty release body
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes-file dist/release/RELEASE_NOTES.md \
+              --verify-tag
+            exit 0
+          fi
+
+          BODY=$(gh release view "$TAG" --json body --jq .body)
+          if [ -z "$(printf '%s' "$BODY" | tr -d '[:space:]')" ]; then
+            gh release edit "$TAG" --notes-file dist/release/RELEASE_NOTES.md
+            echo "Filled empty release body with generated notes."
+          else
+            echo "Release body already has notes; leaving it unchanged."
+          fi
+
+      - name: Upload assets to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" \
+            dist/release/*.so \
+            dist/release/*.tar.gz \
+            dist/release/SHA256SUMS \
+            dist/release/RELEASE_NOTES.md \
+            --clobber
+
+      - name: Write job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Release ${TAG:-unknown}"
+            echo
+            if ls dist/release/*.so dist/release/*.tar.gz >/dev/null 2>&1; then
+              echo "| Asset | Size |"
+              echo "| --- | --- |"
+              for f in dist/release/*.so dist/release/*.tar.gz; do
+                echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"
+              done
+              echo
+            fi
+            echo "## 更新内容"
+            echo
+            if [ -f dist/release/RELEASE_NOTES.md ]; then
+              cat dist/release/RELEASE_NOTES.md
+            else
+              echo "（未生成）"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -130,6 +130,15 @@ BUILD_PROXY=http://host.docker.internal:7897 ./build.sh   # 需要代理时
 SKIP_BUILD=1 ./package.sh # 只打包已有产物
 ```
 
+GitHub Release 由 `.github/workflows/release.yml` 自动处理：
+
+- 在 GitHub 发布 Release（tag 形如 `v0.1.0`）后，Actions 构建 `linux/amd64`、`linux/arm64` 的 `.so`；
+- 生成 `raccoon2api-<version>-linux.tar.gz`、两个架构的独立 `.so` 和 `SHA256SUMS`，上传到该 Release；
+- 用 GitHub 的 generate-notes 生成更新内容：Release 正文为空时自动写入，已经有正文时保留原内容，另外附一份 `RELEASE_NOTES.md`；
+- 也可以在 Actions 页面手动运行该 workflow，填入已有 tag 重新打包。
+
+发版前记得把 `schema.go` 里的 `pluginVersion` 改成与 tag 一致。
+
 ## 安装
 
 把动态库放到 CPA 的插件根目录（CPA 按 `<root>/<goos>/<goarch>/` 查找）：
