@@ -12,7 +12,7 @@ import (
 // the exported C ABI, so it needs no SDK dependency to build.
 const (
 	providerKey   = "raccoon2api"
-	pluginVersion = "0.1.0"
+	pluginVersion = "0.1.1"
 	abiVersion    = 1
 	schemaVersion = 6
 )
