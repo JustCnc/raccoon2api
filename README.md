@@ -140,6 +140,8 @@ GitHub Release 由 `.github/workflows/release.yml` 自动处理：
 
 发版前记得把 `schema.go` 里的 `pluginVersion` 改成与 tag 一致。
 
+完整发版 runbook（给后续 agent）：[RELEASING.md](RELEASING.md)。
+
 ## 安装
 
 把动态库放到 CPA 的插件根目录（CPA 按 `<root>/<goos>/<goarch>/` 查找）：
