@@ -1,0 +1,68 @@
+# raccoon2api — CLIProxyAPI 插件配置示例
+#
+# 宿主键（enabled / priority）由 CPA 注入，这里写的是插件自己的键。
+plugins:
+  enabled: true
+  dir: "plugins"
+  configs:
+    raccoon2api:
+      enabled: true
+      priority: 2
+      data_dir: "/CLIProxyAPI/plugin-data/raccoon2api"
+
+      # 上游网关
+      base_url: "https://xiaohuanxiong.com/api/web/llm/v2"
+      auth_base_url: "https://xiaohuanxiong.com/api/web/auth/v1"
+
+      # 设备指纹（只读挂载）：仅用于对齐上游请求指纹
+      desktop_device_file: "/raccoon-device/desktop-device-identity.json"
+      credential_alias: "default"
+      credential_priority: 10
+      # 账号来源：控制台上传 JSON / 授权码登录，或往这个目录丢 *.json（文件名即别名）
+      accounts_dir: "/raccoon-accounts"
+      import_interval_seconds: 30
+      refresh_margin_seconds: 600
+      # 额度探测：查询账号积分余额；接口不可用时退回一次 max_tokens=1 的最小请求；0 关闭
+      # 每日登录积分：桌面端每天开一次就送 300 积分（当天 23:59:59 过期）。
+      # 插件会替每个账号领取，幂等接口，重复调用只是回 "already granted"。
+      daily_grant_enabled: true
+      quota_probe_seconds: 600
+      # 请求结束后查一次账单，把本次消耗积分写进控制台的请求记录；查询免费
+      points_logging: true
+
+      # 客户端指纹：客户端升级后同步修改
+      client_name: "@raccoon/office-desktop"
+      client_platform: "desktop-windows-x64"
+      client_version: "v1.1.3"
+      client_os_version: "10.0.26100"
+      client_channel: "official"
+      user_agent: "AsyncOpenAI/Python 2.8.0"
+      sdk_version: "2.8.0"
+      python_version: "3.12.13"
+
+      # 模型目录
+      refresh_seconds: 1800
+      model_allowlist: []
+      model_denylist: []
+      image_modalities: "auto"
+      # 目录标了 vision 但实测看不见图片的模型
+      vision_denylist: ["sn-glm-5-3"]
+
+      # 执行与重试
+      max_attempts: 3
+      retry_jitter: true
+      cooldown_seconds: 600
+      quota_cooldown_seconds: 3600
+      request_timeout_seconds: 1200
+      max_tokens_default: 80000
+      reasoning_effort: "low"
+
+      # 授权码登录
+      app_name: "办公小浣熊客户端"
+      login_timeout_seconds: 600
+      # 登录完成后浏览器回到本机这个端口，插件自动把授权码换成 token。
+      # 上游只接受 http://127.0.0.1:<1024-99999>/auth/callback 的 loopback 形式。
+      # Docker 部署要同步映射端口：127.0.0.1:18763:18763；填 0 则退回手动粘贴。
+      login_callback_port: 18763
+
+      debug_dump: false
