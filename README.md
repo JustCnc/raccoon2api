@@ -23,7 +23,10 @@
 
 - **优先级**：与 CPA 一致，**数值越大越先用**。配置里的主账号默认 10，目录里的账号默认 5，上传/授权码新增的默认 1。
 - **选号**：宿主先按自己的调度挑一个（`req.StorageJSON`），插件优先用它；它不可用或失败时，插件按优先级在自己的池子里挑下一个。
-- **冷却**：429/5xx 让该账号冷却 `cooldown_seconds`（有 `Retry-After` 就按它，最长 2h）；401 刷新失败判死并冷却 `cooldown_seconds`；额度不足（`1000007`/402）冷却 `quota_cooldown_seconds` 并**直接失败、不换号**，避免把整池的额度一起烧掉。冷却状态落盘，重启不丢。
+- **并发**：上游对每个账号有并发闸门，**实测每个账号同时只放行 10 个在飞请求**（与 prompt/输出长度无关，换 `x-client-device-id` 也不放宽），第 11 个起立刻回 `429 {"code":200103,"message":"limiter_request_error","details":"request exceed max time, retry after:0s"}`（不带 `Retry-After` 头）。所以插件默认把每个账号的在飞请求压在 `account_concurrency`（10）以内，多出来的在本进程排队，而不是硬撞上去失败；多个账号各自拥有 10 个名额。
+- **没有 token 速率配额**：实测单请求输出稳定在 250~390 token/s（与并发无关，6000 token 的长流也不衰减），10 个在飞时聚合 ~2.4k~2.7k token/s 仍 100% 成功——上游限制的是并发数，不是 tps。
+- **limiter 重试**：拿到这个 `200103` 不算账号出问题——不冷却、不计失败，等 250ms/500ms/750ms/1s（带抖动）后重试同一个账号，最多 4 次；这几次重试不占 `max_attempts` 的换号预算。4 次仍被拒就把该账号本次排除、换下一个账号；真正限流的 429（带 `Retry-After`）才按冷却处理。被限流的次数在控制台「并发上限 / 被限流」和 `/status` 的 `metrics.throttled` 里能看到。
+- **冷却**：429/5xx 让该账号冷却 `cooldown_seconds`（有 `Retry-After` 就按它，最长 2h）；401 刷新失败判死并冷却 `cooldown_seconds`；额度不足（`1000007`/402）冷却 `quota_cooldown_seconds` 并**直接失败、不换号**，避免把整池的额度一起烧掉。**403 只冷却 30s 且不换号**（并发风暴时网关的按账号风控），并把状态行、完整响应头与响应体片段记进 warn 日志（`cookie`/`token`/`session` 一类头已脱敏），用于事后定位；已存在的更长冷却不会被 30s 降级。冷却状态落盘，重启不丢。
 - **积分余额**：直接读账号自己的积分接口 `GET /api/web/points/v1/balance`（桌面端显示的就是它），拿到 `available_points / daily_points / reward_points / topup_points / total_chargeable_points`，**查询不消耗积分**；可用积分为 0 记「积分不足」并冷却 `quota_cooldown_seconds`。接口不可用时退回一次 `max_tokens=1` 的最小请求（成功即正常、402/`1000007` 即不足）。每 `quota_probe_seconds` 自动跑一轮，也可在控制台手动触发（多账号并发）。
 - **单次请求积分**：每次成功请求结束后读一次 `GET /api/web/points/v2/bills`，按 `biz_id = <X-RACCOON-Session-ID>:<X-RACCOON-Turn-ID>` 把本次 turn 的多行 `points` 相加，写进控制台请求记录的「积分」列；账单写入有延迟时最多重试 3 次。查询免费，不需要额外的消费探测；可用 `points_logging: false` 关闭。
 - **自愈**：宿主里的凭据被删会按池子重建；目录里的文件删掉即移出池子。
@@ -272,6 +275,7 @@ registry 本身维护在 [JustCnc/cpa_plugins](https://github.com/JustCnc/cpa_pl
 | `accounts_dir` | 空 | 账号目录：每个 `*.json` 一个账号（文件名即别名） |
 | `credential_priority` | 10 | 桌面端账号优先级（越大越先用） |
 | `max_attempts` | 3 | 单次请求最多尝试几个账号 |
+| `account_concurrency` | 10 | 每个账号同时在飞的上游请求上限（上游实测只放行 10 个），超出的排队等，`0` 不限 |
 | `retry_jitter` | true | 重试退避加随机抖动 |
 | `cooldown_seconds` | 600 | 429/5xx/401 后该账号冷却时长 |
 | `quota_cooldown_seconds` | 3600 | 积分不足后的冷却时长（该次请求直接失败，不换号） |
@@ -287,6 +291,7 @@ registry 本身维护在 [JustCnc/cpa_plugins](https://github.com/JustCnc/cpa_pl
 - **客户端看到模型但请求 401 `未找到小浣熊登录态`**：账号池是空的。打开控制台「添加账号」上传一份凭据 JSON。
 - **`账号 xxx 没有 refresh_token`**：IAM 令牌是 30 天的，本来就不带 refresh_token；到期前重新上传一份新的凭据 JSON。
 - **429/5xx 后请求变慢**：该账号在冷却，插件会换下一个；`/accounts/reset` 可以立即解除。
+- **并发一高就报 403（`auth_unavailable ... 上游返回 HTTP 403`）**：目前按诊断优先处理——403 的请求仍然失败，但该账号会短冷却 30s，控制台日志里有一条 `403 mode=... model=... account=... session=... headers=[...] body=...` 的 warn，带完整响应头，用来判断是风控、限流还是账号问题。
 - **导入 JSON 报「上游拒绝了这个 token」**：token 已失效或被吊销；导入前插件会用该 token 拉一次模型目录，
   401/403 直接拒绝，网络不通则只给警告仍然导入。
 - **授权码兑换报 200035**：码是一次性的，桌面端已经先消费掉了。直接让桌面端登录，插件会从 `auth.json` 导入。

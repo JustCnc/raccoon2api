@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,6 +38,292 @@ func twoAccountApp(t *testing.T, chatURL, authURL string) (*app, Config, *creden
 	a.upsertAccount(first)
 	a.upsertAccount(second)
 	return a, cfg, first, second
+}
+
+func TestForbiddenIsLoggedAndCoolsDown(t *testing.T) {
+	var callsA, callsB int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer token-a":
+			atomic.AddInt32(&callsA, 1)
+			w.Header().Set("Server", "waf-test")
+			w.WriteHeader(http.StatusForbidden)
+		case "Bearer token-b":
+			atomic.AddInt32(&callsB, 1)
+			fmt.Fprint(w, `{"id":"c1","choices":[{"index":0,"message":{"content":"ok"}}]}`)
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer server.Close()
+
+	a, cfg, first, second := twoAccountApp(t, server.URL, "")
+	_, _, _, err := a.callUpstream(context.Background(), cfg, "sn-glm-5-3-flash",
+		[]byte(`{"model":"sn-glm-5-3-flash","messages":[]}`), nil, first.ID)
+	if err == nil {
+		t.Fatal("expected a 403 failure")
+	}
+	if failure := asFailure(err); failure.Status != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", failure.Status)
+	}
+	// Diagnostics first: a 403 still fails the request instead of rotating.
+	if atomic.LoadInt32(&callsB) != 0 {
+		t.Fatalf("403 must not rotate yet: account b called %d times", callsB)
+	}
+	cooled := a.poolAccount(first.ID)
+	if cooled == nil || !cooled.cooling(time.Now()) {
+		t.Fatalf("403 account should cool down: %+v", cooled)
+	}
+	if remaining := cooled.cooldownRemaining(time.Now()); remaining < 25*time.Second || remaining > forbiddenCooldown {
+		t.Fatalf("403 cooldown = %v, want ~%v", remaining, forbiddenCooldown)
+	}
+	if cooled.Dead {
+		t.Fatalf("a 403 must not kill the account: %+v", cooled)
+	}
+	if healthy := a.poolAccount(second.ID); healthy == nil || healthy.cooling(time.Now()) {
+		t.Fatalf("account b must stay healthy: %+v", healthy)
+	}
+	var found bool
+	for _, entry := range a.log.tail(0) {
+		if !strings.Contains(entry.Message, "403 mode=buffered") {
+			continue
+		}
+		found = true
+		for _, want := range []string{"account=a", "attempt=1", "proto=HTTP", "session=ses-", "turn=", "waf-test"} {
+			if !strings.Contains(entry.Message, want) {
+				t.Fatalf("403 log missing %q: %s", want, entry.Message)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("403 response was not logged: %+v", a.log.tail(0))
+	}
+}
+
+func TestForbiddenStreamIsLoggedAndCoolsDown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Set-Cookie", "sid=secret-value")
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	a, cfg, first, second := twoAccountApp(t, server.URL, "")
+	_, _, _, err := a.openStream(context.Background(), cfg, "sn-glm-5-3-flash",
+		[]byte(`{"model":"sn-glm-5-3-flash","messages":[],"stream":true}`), nil, first.ID)
+	if err == nil {
+		t.Fatal("expected a 403 failure")
+	}
+	if failure := asFailure(err); failure.Status != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", failure.Status)
+	}
+	if cooled := a.poolAccount(first.ID); cooled == nil || !cooled.cooling(time.Now()) {
+		t.Fatalf("403 account should cool down: %+v", cooled)
+	}
+	if healthy := a.poolAccount(second.ID); healthy == nil || healthy.cooling(time.Now()) {
+		t.Fatalf("account b must stay healthy: %+v", healthy)
+	}
+	var found bool
+	for _, entry := range a.log.tail(0) {
+		if !strings.Contains(entry.Message, "403 mode=stream") {
+			continue
+		}
+		found = true
+		if strings.Contains(entry.Message, "secret-value") {
+			t.Fatalf("cookie value leaked into the log: %s", entry.Message)
+		}
+	}
+	if !found {
+		t.Fatalf("stream 403 was not logged: %+v", a.log.tail(0))
+	}
+}
+
+func TestForbiddenDoesNotShortenLongerCooldown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	a, cfg, first, _ := twoAccountApp(t, server.URL, "")
+	a.setCooldown(first.ID, time.Now().Add(time.Hour), "quota")
+	_, _, _, err := a.callUpstream(context.Background(), cfg, "sn-glm-5-3-flash",
+		[]byte(`{"model":"sn-glm-5-3-flash","messages":[]}`), nil, first.ID)
+	if err == nil {
+		t.Fatal("expected a 403 failure")
+	}
+	cooled := a.poolAccount(first.ID)
+	if remaining := cooled.cooldownRemaining(time.Now()); remaining < 55*time.Minute {
+		t.Fatalf("403 shortened an hour-long cooldown to %v", remaining)
+	}
+}
+
+func TestLimiterRetryKeepsAccountInPool(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) <= 2 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, `{"code":200103,"message":"limiter_request_error","details":"request exceed max time, retry after:0s"}`)
+			return
+		}
+		fmt.Fprint(w, `{"id":"c1","choices":[{"index":0,"message":{"content":"ok"}}]}`)
+	}))
+	defer server.Close()
+
+	a, cfg, first, _ := twoAccountApp(t, server.URL, "")
+	headers, payload, _, err := a.callUpstream(context.Background(), cfg, "sn-glm-5-3-flash",
+		[]byte(`{"model":"sn-glm-5-3-flash","messages":[]}`), nil, first.ID)
+	if err != nil {
+		t.Fatalf("limiter refusal must be retried, got %v", err)
+	}
+	if headers == nil || !strings.Contains(string(payload), `"ok"`) {
+		t.Fatalf("payload = %s", payload)
+	}
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Fatalf("calls = %d, want 3", got)
+	}
+	account := a.poolAccount(first.ID)
+	if account == nil || account.cooling(time.Now()) {
+		t.Fatalf("a limiter refusal must not cool the account down: %+v", account)
+	}
+}
+
+func TestLimiterExhaustionRotatesToNextAccount(t *testing.T) {
+	var callsA, callsB int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer token-a":
+			atomic.AddInt32(&callsA, 1)
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, `{"code":200103,"message":"limiter_request_error"}`)
+		case "Bearer token-b":
+			atomic.AddInt32(&callsB, 1)
+			fmt.Fprint(w, `{"id":"c1","choices":[{"index":0,"message":{"content":"ok"}}]}`)
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer server.Close()
+
+	a, cfg, first, second := twoAccountApp(t, server.URL, "")
+	_, payload, usedID, err := a.callUpstream(context.Background(), cfg, "sn-glm-5-3-flash",
+		[]byte(`{"model":"sn-glm-5-3-flash","messages":[]}`), nil, first.ID)
+	if err != nil {
+		t.Fatalf("the busy account must hand over to the idle one: %v", err)
+	}
+	if usedID != second.ID || !strings.Contains(string(payload), `"ok"`) {
+		t.Fatalf("used %s payload %s, want the second account", usedID, payload)
+	}
+	if got := atomic.LoadInt32(&callsA); got != 1+limiterRetries {
+		t.Fatalf("busy account calls = %d, want %d", got, 1+limiterRetries)
+	}
+	if got := atomic.LoadInt32(&callsB); got != 1 {
+		t.Fatalf("idle account calls = %d, want 1", got)
+	}
+	for _, account := range []*credential{a.poolAccount(first.ID), a.poolAccount(second.ID)} {
+		if account == nil || account.cooling(time.Now()) {
+			t.Fatalf("limiter refusals must not park an account: %+v", account)
+		}
+	}
+}
+
+func TestLimiterRefusalRidesOutShortBurst(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) <= limiterRetries {
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, `{"code":200103,"message":"limiter_request_error"}`)
+			return
+		}
+		fmt.Fprint(w, `{"id":"c1","choices":[{"index":0,"message":{"content":"ok"}}]}`)
+	}))
+	defer server.Close()
+
+	a, cfg, first, _ := twoAccountApp(t, server.URL, "")
+	if _, _, _, err := a.callUpstream(context.Background(), cfg, "sn-glm-5-3-flash",
+		[]byte(`{"model":"sn-glm-5-3-flash","messages":[]}`), nil, first.ID); err != nil {
+		t.Fatalf("limiter retries must ride it out: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != limiterRetries+1 {
+		t.Fatalf("calls = %d, want %d", got, limiterRetries+1)
+	}
+}
+
+func TestLimiterIsTransientButQuotaIsNot(t *testing.T) {
+	limiter := classifyFailure(http.StatusTooManyRequests,
+		[]byte(`{"code":200103,"message":"limiter_request_error","details":"request exceed max time, retry after:0s"}`))
+	if !limiter.Transient || limiter.Quota || limiter.Status != http.StatusTooManyRequests {
+		t.Fatalf("limiter failure = %+v, want transient 429", limiter)
+	}
+	// The phrase alone on a 5xx must stay on the retry/rotate path.
+	server := classifyFailure(http.StatusBadGateway, []byte(`{"message":"request exceed max time"}`))
+	if server.Transient {
+		t.Fatalf("a 502 must not be treated as the limiter: %+v", server)
+	}
+	quota := classifyFailure(http.StatusTooManyRequests, []byte(`{"code":1000007,"message":"limiter_request_error insufficient credits"}`))
+	if !quota.Quota || quota.Transient {
+		t.Fatalf("quota must win over the limiter: %+v", quota)
+	}
+	auth := classifyFailure(http.StatusTooManyRequests, []byte(`{"code":200001,"message":"limiter_request_error"}`))
+	if auth.Status != http.StatusUnauthorized || auth.Transient {
+		t.Fatalf("auth must win over the limiter: %+v", auth)
+	}
+}
+
+func TestAccountConcurrencyDisabled(t *testing.T) {
+	a, cfg, first, _ := twoAccountApp(t, "http://127.0.0.1:1", "")
+	cfg.AccountConcurrency = 0
+	a.cfg = cfg
+	release, err := a.acquireAccountSlot(context.Background(), first.ID)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	release()
+	release() // must stay a no-op
+}
+
+func TestAccountConcurrencyCapsInflight(t *testing.T) {
+	var inflight, peak int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := atomic.AddInt32(&inflight, 1)
+		for {
+			seen := atomic.LoadInt32(&peak)
+			if current <= seen || atomic.CompareAndSwapInt32(&peak, seen, current) {
+				break
+			}
+		}
+		time.Sleep(120 * time.Millisecond)
+		atomic.AddInt32(&inflight, -1)
+		fmt.Fprint(w, `{"id":"c1","choices":[{"index":0,"message":{"content":"ok"}}]}`)
+	}))
+	defer server.Close()
+
+	a, cfg, first, _ := twoAccountApp(t, server.URL, "")
+	cfg.AccountConcurrency = 2
+	a.cfg = cfg
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 6)
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _, err := a.callUpstream(context.Background(), cfg, "sn-glm-5-3-flash",
+				[]byte(`{"model":"sn-glm-5-3-flash","messages":[]}`), nil, first.ID)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("queued request failed: %v", err)
+		}
+	}
+	if peak > 2 {
+		t.Fatalf("peak in-flight = %d, want <= 2", peak)
+	}
+	if peak < 2 {
+		t.Fatalf("peak in-flight = %d, the queue never ran in parallel", peak)
+	}
 }
 
 func TestRetryRotatesOnRateLimit(t *testing.T) {

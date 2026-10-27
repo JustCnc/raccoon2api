@@ -136,6 +136,65 @@ func TestExecuteRecordsRequestEntry(t *testing.T) {
 	}
 }
 
+func TestStreamReleasesAccountSlot(t *testing.T) {
+	chunks := strings.Join([]string{
+		`data: {"id":"chatcmpl-9","model":"sn-glm-5-3-flash","choices":[{"index":0,"delta":{"content":"O"}}]}`,
+		`data: {"id":"chatcmpl-9","model":"sn-glm-5-3-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(chunks))
+	}))
+	defer server.Close()
+
+	host := &fakeHost{}
+	host.install(t)
+	a := newTestApp(t)
+	cfg := a.currentConfig()
+	cfg.BaseURL = server.URL
+	cfg.AccountConcurrency = 1
+	a.cfg = cfg
+	account := testAccount("raccoon2api-slot", 10, time.Now().Add(time.Hour))
+	a.upsertAccount(account)
+	snapshot, err := parseCatalog([]byte(catalogSample))
+	if err != nil {
+		t.Fatalf("catalog: %v", err)
+	}
+	a.setCatalog(snapshot)
+
+	for i := 0; i < 3; i++ {
+		raw, _ := json.Marshal(rpcExecutorRequest{
+			StreamID: "stream-slot",
+			executorRequest: executorRequest{
+				Format:  formatChat,
+				Model:   "sn-glm-5-3-flash",
+				Payload: []byte(`{"model":"sn-glm-5-3-flash","messages":[{"role":"user","content":"hi"}],"max_tokens":16}`),
+			},
+		})
+		if _, err := a.executeStream(raw); err != nil {
+			t.Fatalf("executeStream: %v", err)
+		}
+		// With a cap of one, a leaked slot would block every later call.
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) && a.inflightCount(account.ID) > 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := a.inflightCount(account.ID); got != 0 {
+			t.Fatalf("run %d: %d stream slots still checked out", i, got)
+		}
+	}
+}
+
+// inflightCount reports how many slots one account currently has checked out.
+func (a *app) inflightCount(id string) int {
+	a.flightMu.Lock()
+	defer a.flightMu.Unlock()
+	return len(a.flight[id])
+}
+
 // A streaming call must report first-token latency and the usage trailer.
 func TestStreamRecordsTTFTAndUsage(t *testing.T) {
 	chunks := strings.Join([]string{

@@ -156,6 +156,7 @@ type metrics struct {
 	success     int64
 	failures    int64
 	streams     int64
+	throttled   int64
 	lastLatency int64
 	totalMs     int64
 	started     time.Time
@@ -184,6 +185,14 @@ func (m *metrics) markStream() {
 	m.mu.Unlock()
 }
 
+// markThrottled counts the gateway's limiter refusals (200103), so the console
+// shows how often the per-account admission gate was hit.
+func (m *metrics) markThrottled() {
+	m.mu.Lock()
+	m.throttled++
+	m.mu.Unlock()
+}
+
 func (m *metrics) snapshot() map[string]any {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -196,6 +205,7 @@ func (m *metrics) snapshot() map[string]any {
 		"success":        m.success,
 		"failures":       m.failures,
 		"streams":        m.streams,
+		"throttled":      m.throttled,
 		"last_latency":   m.lastLatency,
 		"average_ms":     average,
 		"uptime_seconds": int64(time.Since(m.started).Seconds()),

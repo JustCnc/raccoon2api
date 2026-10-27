@@ -748,6 +748,7 @@ function renderStatus(data) {
     ['账号目录', runtime.accounts_dir || '未配置'],
     ['积分查询间隔', (runtime.quota_probe_seconds || 0) + ' 秒'],
     ['总请求 / 失败', (metrics.requests || 0) + ' / ' + (metrics.failures || 0)],
+    ['并发上限 / 被限流', (runtime.account_concurrency || 0) + ' / ' + (metrics.throttled || 0)],
     ['平均耗时', (metrics.average_ms || 0) + ' ms'],
     ['运行时长', fmtLeft(metrics.uptime_seconds || 0)],
   ].map(([k, v]) => `<div class="kv-item"><span class="kv-key">${esc(k)}</span><span class="kv-val mono" style="font-size:11.5px;">${esc(v)}</span></div>`).join('');

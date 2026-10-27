@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,6 +19,10 @@ type upstreamFailure struct {
 	Retryable bool
 	// Quota marks "this account is out of credits": fail fast, never rotate.
 	Quota bool
+	// Transient marks the gateway's own concurrency limiter (200103): the account
+	// is healthy and only had no free slot, so the request waits a moment and
+	// retries the same account instead of parking it.
+	Transient bool
 	// RetryAfter is the delay the upstream asked for, when it said so.
 	RetryAfter time.Duration
 }
@@ -306,6 +311,9 @@ func (a *app) callUpstream(ctx context.Context, cfg Config, model string, body [
 	var lastErr error
 	refreshed := map[string]bool{}
 	netFailures := 0
+	// limiterWaits counts limiter refusals per account: the budget belongs to the
+	// account that was refused, not to the request.
+	limiterWaits := map[string]int{}
 
 	for attempt := 1; attempt <= cfg.MaxAttempts; attempt++ {
 		account := a.selectAccount(preferred, excluded, time.Now())
@@ -323,8 +331,13 @@ func (a *app) callUpstream(ctx context.Context, cfg Config, model string, body [
 		}
 		conv := conversationFrom(cred, clientHeaders, fields)
 
+		release, errSlot := a.acquireAccountSlot(ctx, account.ID)
+		if errSlot != nil {
+			return nil, nil, "", &upstreamFailure{Status: http.StatusBadGateway, Message: "等待账号并发槽位失败：" + errSlot.Error(), Retryable: true}
+		}
 		resp, errSend := a.send(ctx, cfg, model, body, conv, cred, false)
 		if errSend != nil {
+			release()
 			lastErr = errSend
 			netFailures++
 			if netFailures >= 2 {
@@ -339,6 +352,7 @@ func (a *app) callUpstream(ctx context.Context, cfg Config, model string, body [
 		headers := resp.Header.Clone()
 		payload, errRead := readLimited(resp.Body, 64<<20)
 		resp.Body.Close()
+		release()
 		if errRead != nil {
 			lastErr = &upstreamFailure{Status: http.StatusBadGateway, Message: "读取上游响应失败：" + errRead.Error(), Retryable: true}
 			excluded[account.ID] = true
@@ -358,9 +372,16 @@ func (a *app) callUpstream(ctx context.Context, cfg Config, model string, body [
 		}
 
 		failure := classifyFailure(resp.StatusCode, payload)
-		a.noteAccountFailure(account.ID)
+		if !failure.Transient {
+			a.noteAccountFailure(account.ID)
+		}
 		failure.RetryAfter = retryAfter(headers)
 		lastErr = failure
+		if failure.Status == http.StatusForbidden {
+			a.logForbidden(account, model, resp.Proto, "buffered", attempt, headers, payload, conv)
+			a.parkAccountFor403(account.ID, forbiddenDelay(failure))
+			return nil, nil, account.ID, failure
+		}
 
 		switch {
 		case failure.Quota:
@@ -379,6 +400,23 @@ func (a *app) callUpstream(ctx context.Context, cfg Config, model string, body [
 				continue
 			}
 			a.markAccountDead(account.ID, failure.Message)
+			excluded[account.ID] = true
+			if attempt < cfg.MaxAttempts {
+				continue
+			}
+		case failure.Transient:
+			// The gateway's own limiter answers 200103 "retry after:0s": the
+			// account is healthy, it just had no free slot. Wait for the queue to
+			// drain and retry the same account instead of parking it. These waits
+			// do not consume the account-rotation budget.
+			a.metrics.markThrottled()
+			limiterWaits[account.ID]++
+			a.log.debug("upstream", fmt.Sprintf("limiter refused model=%s account=%s wait=%d", model, account.Alias, limiterWaits[account.ID]))
+			if limiterWaits[account.ID] <= limiterRetries && sleepCtx(ctx, limiterBackoff(limiterWaits[account.ID], cfg)) {
+				attempt--
+				continue
+			}
+			// Still refused after the waits: let another account take it.
 			excluded[account.ID] = true
 			if attempt < cfg.MaxAttempts {
 				continue
@@ -408,6 +446,9 @@ func (a *app) openStream(ctx context.Context, cfg Config, model string, body []b
 	var lastErr error
 	refreshed := map[string]bool{}
 	netFailures := 0
+	// limiterWaits counts limiter refusals per account: the budget belongs to the
+	// account that was refused, not to the request.
+	limiterWaits := map[string]int{}
 
 	for attempt := 1; attempt <= cfg.MaxAttempts; attempt++ {
 		account := a.selectAccount(preferred, excluded, time.Now())
@@ -425,8 +466,13 @@ func (a *app) openStream(ctx context.Context, cfg Config, model string, body []b
 		}
 		conv := conversationFrom(cred, clientHeaders, fields)
 
+		release, errSlot := a.acquireAccountSlot(ctx, account.ID)
+		if errSlot != nil {
+			return nil, nil, "", &upstreamFailure{Status: http.StatusBadGateway, Message: "等待账号并发槽位失败：" + errSlot.Error(), Retryable: true}
+		}
 		resp, errSend := a.send(ctx, cfg, model, body, conv, cred, true)
 		if errSend != nil {
+			release()
 			lastErr = errSend
 			netFailures++
 			if netFailures >= 2 {
@@ -440,14 +486,24 @@ func (a *app) openStream(ctx context.Context, cfg Config, model string, body []b
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			a.noteAccountSuccess(account.ID)
-			return resp, resp.Body, account.ID, nil
+			// The slot lives as long as the stream: the gateway counts a
+			// request as in flight until its body is closed.
+			return resp, &slotBody{ReadCloser: resp.Body, release: release}, account.ID, nil
 		}
 		payload, _ := readLimited(resp.Body, 1<<20)
 		resp.Body.Close()
+		release()
 		failure := classifyFailure(resp.StatusCode, payload)
-		a.noteAccountFailure(account.ID)
+		if !failure.Transient {
+			a.noteAccountFailure(account.ID)
+		}
 		failure.RetryAfter = retryAfter(resp.Header)
 		lastErr = failure
+		if failure.Status == http.StatusForbidden {
+			a.logForbidden(account, model, resp.Proto, "stream", attempt, resp.Header, payload, conv)
+			a.parkAccountFor403(account.ID, forbiddenDelay(failure))
+			return nil, nil, "", failure
+		}
 
 		switch {
 		case failure.Quota:
@@ -469,6 +525,20 @@ func (a *app) openStream(ctx context.Context, cfg Config, model string, body []b
 			if attempt < cfg.MaxAttempts {
 				continue
 			}
+		case failure.Transient:
+			// Same limiter answer as the buffered path: wait and retry the
+			// account instead of parking it for cooldown_seconds.
+			a.metrics.markThrottled()
+			limiterWaits[account.ID]++
+			a.log.debug("upstream", fmt.Sprintf("limiter refused model=%s account=%s wait=%d stream", model, account.Alias, limiterWaits[account.ID]))
+			if limiterWaits[account.ID] <= limiterRetries && sleepCtx(ctx, limiterBackoff(limiterWaits[account.ID], cfg)) {
+				attempt--
+				continue
+			}
+			excluded[account.ID] = true
+			if attempt < cfg.MaxAttempts {
+				continue
+			}
 		case failure.Retryable:
 			// Retry-After describes this account's cooldown, not a reason to
 			// stall the client: rotate immediately and let the next account try.
@@ -484,6 +554,61 @@ func (a *app) openStream(ctx context.Context, cfg Config, model string, body []b
 		lastErr = &upstreamFailure{Status: http.StatusBadGateway, Message: "上游请求失败"}
 	}
 	return nil, nil, "", lastErr
+}
+
+// slotBody keeps an account's in-flight slot checked out until the stream ends.
+type slotBody struct {
+	io.ReadCloser
+	release func()
+	once    sync.Once
+}
+
+func (b *slotBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.release)
+	return err
+}
+
+// acquireAccountSlot waits for a free in-flight slot on one account. The gateway
+// admits exactly 10 parallel requests per account and refuses the rest with a
+// limiter error, so the plugin queues at that level instead of letting bursts
+// fail. A zero cap disables the gate.
+func (a *app) acquireAccountSlot(ctx context.Context, id string) (func(), error) {
+	cfg := a.currentConfig()
+	limit := cfg.AccountConcurrency
+	if limit <= 0 || id == "" {
+		return func() {}, nil
+	}
+	a.flightMu.Lock()
+	if a.flight == nil {
+		a.flight = map[string]chan struct{}{}
+	}
+	if a.flightLimit == nil {
+		a.flightLimit = map[string]int{}
+	}
+	slots := a.flight[id]
+	// A changed cap only takes effect once the old channel has drained; that
+	// keeps a live holder's release paired with the channel it checked out of.
+	if slots == nil || a.flightLimit[id] != limit {
+		if slots == nil || len(slots) == 0 {
+			slots = make(chan struct{}, limit)
+			a.flight[id] = slots
+			a.flightLimit[id] = limit
+		}
+	}
+	a.flightMu.Unlock()
+
+	// A stalled host emit can hold a stream slot forever, so the wait itself is
+	// bounded: past that the request fails instead of queueing indefinitely.
+	waitCtx, cancel := context.WithTimeout(ctx, cfg.requestTimeout())
+	defer cancel()
+	select {
+	case slots <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-slots }) }, nil
+	case <-waitCtx.Done():
+		return nil, waitCtx.Err()
+	}
 }
 
 func (a *app) send(ctx context.Context, cfg Config, model string, body []byte, conv conversation, cred *credential, stream bool) (*http.Response, error) {
@@ -833,7 +958,25 @@ func classifyFailure(status int, body []byte) *upstreamFailure {
 		failure.Retryable = false
 		failure.Quota = true
 	}
+	if failure.Status == http.StatusTooManyRequests && !failure.Quota && isLimiterFailure(code, message) {
+		// The concurrency limiter, not a throttled account: retry shortly instead
+		// of cooling the credential down. Only a 429 counts, so a 5xx that happens
+		// to echo the phrase stays on the retry/rotate path.
+		failure.Transient = true
+	}
 	return failure
+}
+
+// isLimiterFailure recognises the gateway's own queue refusal. The body is
+// {"code":200103,"message":"limiter_request_error","details":"request exceed max
+// time, retry after:0s"}; the Retry-After it mentions is zero because the
+// gateway expects an immediate retry once a slot frees up.
+func isLimiterFailure(code, message string) bool {
+	if code == "200103" {
+		return true
+	}
+	lowered := strings.ToLower(message)
+	return strings.Contains(lowered, "limiter_request_error") || strings.Contains(lowered, "exceed max time")
 }
 
 // isQuotaMessage recognises "out of credits" wording. The markers are phrases,
@@ -895,6 +1038,53 @@ func clampDelay(d time.Duration) time.Duration {
 		return time.Second
 	}
 	return d
+}
+
+// forbiddenCooldown is deliberately short: a 403 during a burst looks like the
+// gateway's per-account concurrency guard, not a broken credential, so the
+// account only steps aside instead of being parked for cooldown_seconds.
+const forbiddenCooldown = 30 * time.Second
+
+// forbiddenDelay honours a longer Retry-After the gateway asked for on the 403.
+func forbiddenDelay(failure *upstreamFailure) time.Duration {
+	if failure != nil && failure.RetryAfter > forbiddenCooldown {
+		return failure.RetryAfter
+	}
+	return forbiddenCooldown
+}
+
+// parkAccountFor403 steps the account aside for a short while without
+// shortening a longer cooldown another failure already set: selectAccount falls
+// back to cooling accounts when nothing healthy is left, so a 403 can land on an
+// account that is parked for an hour of quota cooldown.
+func (a *app) parkAccountFor403(id string, d time.Duration) {
+	if id == "" || d <= 0 {
+		return
+	}
+	until := time.Now().Add(d)
+	if account := a.poolAccount(id); account != nil && account.CooldownUntil >= until.UnixMilli() {
+		return
+	}
+	a.setCooldown(id, until, "HTTP 403")
+}
+
+// logForbidden records everything the gateway said on a 403. The body is usually
+// empty (the message degrades to "上游返回 HTTP 403"), so the headers — WAF
+// markers, ratelimit counters, Retry-After — are the evidence that explains why
+// parallel requests were refused.
+func (a *app) logForbidden(account *credential, model, proto, mode string, attempt int, headers http.Header, payload []byte, conv conversation) {
+	alias := ""
+	if account != nil {
+		alias = account.Alias
+	}
+	body := strings.TrimSpace(string(payload))
+	if body == "" {
+		body = "<empty>"
+	}
+	a.log.warn("upstream", fmt.Sprintf(
+		"403 mode=%s model=%s account=%s attempt=%d proto=%s session=%s turn=%s headers=[%s] body=%s",
+		mode, model, alias, attempt, proto, conv.SessionID, conv.TurnID, dumpHeaders(headers), truncateRunes(body, 600),
+	))
 }
 
 func cooldownFor(cfg Config, failure *upstreamFailure) time.Duration {
@@ -1029,6 +1219,25 @@ func backoff(attempt int, cfg Config) time.Duration {
 	return base + jitter
 }
 
+// limiterRetries is how many extra attempts a request is allowed after the
+// gateway's concurrency limiter said "retry after 0s". These attempts do not
+// consume the account-rotation budget (max_attempts).
+const limiterRetries = 4
+
+// limiterBackoff waits a fraction of a second before retrying a limiter refusal:
+// 250ms, 500ms, 750ms, 1s for the four allowed waits, plus jitter.
+func limiterBackoff(waits int, cfg Config) time.Duration {
+	base := time.Duration(waits) * 250 * time.Millisecond
+	if base > 2*time.Second {
+		base = 2 * time.Second
+	}
+	if !cfg.RetryJitter {
+		return base
+	}
+	jitter := time.Duration(float64(base) * (0.3 * (randFraction()*2 - 1)))
+	return base + jitter
+}
+
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {
 		return true
@@ -1047,12 +1256,28 @@ func dumpHeaders(headers http.Header) string {
 	parts := make([]string, 0, len(headers))
 	for _, key := range sortedKeys(headers) {
 		value := strings.Join(headers[key], ",")
-		if strings.EqualFold(key, "Authorization") {
-			value = "Bearer <redacted>"
+		if sensitiveHeader(key) {
+			value = "<redacted>"
 		}
 		parts = append(parts, key+": "+value)
 	}
 	return strings.Join(parts, " | ")
+}
+
+// sensitiveHeader covers the headers that carry credentials or session material:
+// dumps end up in the console log ring, which is readable over HTTP.
+func sensitiveHeader(name string) bool {
+	lowered := strings.ToLower(name)
+	switch lowered {
+	case "authorization", "cookie", "set-cookie":
+		return true
+	}
+	for _, marker := range []string{"token", "secret", "api-key", "apikey", "password", "session"} {
+		if strings.Contains(lowered, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // isErrorEnvelope reports whether a 2xx body is actually a gateway error: an

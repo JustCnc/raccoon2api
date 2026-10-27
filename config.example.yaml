@@ -53,6 +53,8 @@ plugins:
 
       # 执行与重试
       max_attempts: 3
+      # 每个账号同时在飞的上游请求上限（实测上游只放行 10 个），超出的排队等，0 不限
+      account_concurrency: 10
       retry_jitter: true
       cooldown_seconds: 600
       quota_cooldown_seconds: 3600

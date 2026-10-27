@@ -38,6 +38,11 @@ type app struct {
 	credMu   sync.Mutex
 	accounts map[string]*credential
 	refresh  map[string]*refreshFlight
+	// flight holds one buffered channel per account: its length is the number of
+	// requests currently in flight upstream for that account.
+	flightMu    sync.Mutex
+	flight      map[string]chan struct{}
+	flightLimit map[string]int
 
 	deviceMu sync.Mutex
 	device   string

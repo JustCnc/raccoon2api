@@ -74,7 +74,12 @@ type Config struct {
 	VisionDenylist []string `yaml:"vision_denylist"`
 
 	// Execution.
-	MaxAttempts          int    `yaml:"max_attempts"`
+	MaxAttempts int `yaml:"max_attempts"`
+	// AccountConcurrency caps the requests in flight upstream per account. The
+	// gateway admits exactly 10 parallel requests per account and refuses the
+	// rest with a limiter error, so the plugin queues at that level instead of
+	// letting bursts fail. 0 disables the cap.
+	AccountConcurrency   int    `yaml:"account_concurrency"`
 	RetryJitter          bool   `yaml:"retry_jitter"`
 	CooldownSeconds      int    `yaml:"cooldown_seconds"`
 	QuotaCooldownSeconds int    `yaml:"quota_cooldown_seconds"`
@@ -128,6 +133,7 @@ func defaultConfig() Config {
 		ImageModalities:       "auto",
 		VisionDenylist:        []string{"sn-glm-5-3"},
 		MaxAttempts:           3,
+		AccountConcurrency:    10,
 		RetryJitter:           true,
 		RequestTimeoutSeconds: 1200,
 		MaxTokensDefault:      80000,
@@ -264,6 +270,12 @@ func (c *Config) normalize() error {
 	}
 	if c.MaxAttempts > 8 {
 		c.MaxAttempts = 8
+	}
+	if c.AccountConcurrency < 0 {
+		c.AccountConcurrency = 0
+	}
+	if c.AccountConcurrency > 64 {
+		c.AccountConcurrency = 64
 	}
 	if c.RequestTimeoutSeconds <= 0 {
 		c.RequestTimeoutSeconds = 1200
@@ -403,6 +415,7 @@ func pluginConfigFields() []configField {
 		{Name: "image_modalities", Type: "enum", Default: "auto", EnumValues: []string{"auto", "all", "none"}, Description: "图片输入能力的声明策略"},
 		{Name: "vision_denylist", Type: "array", Default: []string{"sn-glm-5-3"}, Description: "目录标了 vision 但实际看不见图片的模型（实测）"},
 		{Name: "max_attempts", Type: "integer", Default: 3, Description: "单次请求最多尝试几个账号"},
+		{Name: "account_concurrency", Type: "integer", Default: 10, Description: "每个账号同时在飞的上游请求上限（实测上游只放行 10 个），0 表示不限"},
 		{Name: "retry_jitter", Type: "boolean", Default: true, Description: "重试退避加随机抖动"},
 		{Name: "cooldown_seconds", Type: "integer", Default: 600, Description: "429/5xx 后该账号冷却时长（秒）"},
 		{Name: "quota_cooldown_seconds", Type: "integer", Default: 3600, Description: "额度不足后该账号冷却时长（秒）"},
