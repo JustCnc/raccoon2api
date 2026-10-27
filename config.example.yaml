@@ -4,6 +4,9 @@
 plugins:
   enabled: true
   dir: "plugins"
+  # 本项目的第三方插件源；官方源始终内置
+  store-sources:
+    - "https://raw.githubusercontent.com/JustCnc/cpa_plugins/main/registry.json"
   configs:
     raccoon2api:
       enabled: true

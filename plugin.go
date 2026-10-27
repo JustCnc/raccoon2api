@@ -280,10 +280,10 @@ func (a *app) registration() registration {
 	return registration{
 		SchemaVersion: schemaVersion,
 		Metadata: pluginMetadata{
-			Name:             "Raccoon Office (xiaohuanxiong)",
+			Name:             "Raccoon2API (xiaohuanxiong)",
 			Version:          pluginVersion,
-			Author:           "raccoon2api",
-			GitHubRepository: "https://github.com/",
+			Author:           "JustCnc",
+			GitHubRepository: "https://github.com/JustCnc/raccoon2api",
 			Logo:             "",
 			ConfigFields:     pluginConfigFields(),
 		},

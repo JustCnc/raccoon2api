@@ -132,8 +132,9 @@ SKIP_BUILD=1 ./package.sh # 只打包已有产物
 
 GitHub Release 由 `.github/workflows/release.yml` 自动处理：
 
-- 在 GitHub 发布 Release（tag 形如 `v0.1.0`）后，Actions 构建 `linux/amd64`、`linux/arm64` 的 `.so`；
-- 生成 `raccoon2api-<version>-linux.tar.gz`、两个架构的独立 `.so` 和 `SHA256SUMS`，上传到该 Release；
+- 在 GitHub 发布 Release（tag 形如 `v0.1.0`）后，Actions 构建 `linux/amd64`、`linux/arm64` 的 `.so` 和 `windows/amd64` 的 `.dll`；
+- 生成 `raccoon2api-<version>-linux.tar.gz`、两个 Linux 架构的独立 `.so` 和 `SHA256SUMS`；Windows `.dll` 随商店 zip 一起发布；
+- 同时生成插件商店要求的 `raccoon2api_<version>_<goos>_<goarch>.zip` 和 `checksums.txt`（zip 根目录只放 `raccoon2api.so` / `raccoon2api.dll`）；
 - 用 GitHub 的 generate-notes 生成更新内容：Release 正文为空时自动写入，已经有正文时保留原内容，另外附一份 `RELEASE_NOTES.md`；
 - 也可以在 Actions 页面手动运行该 workflow，填入已有 tag 重新打包。
 
@@ -153,6 +154,9 @@ cp dist/plugins/linux/amd64/raccoon2api.so <CPA>/plugins/linux/amd64/raccoon2api
 plugins:
   enabled: true
   dir: "plugins"
+  # 第三方插件源（本项目维护；官方源始终内置）
+  store-sources:
+    - "https://raw.githubusercontent.com/JustCnc/cpa_plugins/main/registry.json"
   configs:
     raccoon2api:
       enabled: true
@@ -172,6 +176,37 @@ plugins:
 
 > 设备指纹文件在 `%APPDATA%\office-raccoon\` 下，只读挂进去即可；账号不需要挂桌面端目录。
 > `./accounts` 要可写，这样在控制台删除账号时能一并删掉源文件。
+
+## 插件市场
+
+本项目的 Release 资产按 CPA 插件商店的约定打包，并维护一个第三方 registry：
+
+```text
+https://raw.githubusercontent.com/JustCnc/cpa_plugins/main/registry.json
+```
+
+在 CPA 的 `config.yaml` 里加上（官方源始终内置，不需要重复添加）：
+
+```yaml
+plugins:
+  store-sources:
+    - "https://raw.githubusercontent.com/JustCnc/cpa_plugins/main/registry.json"
+```
+
+也可以在 GUI 的「配置面板 → 高级 → 第三方插件源」里每行填一个 URL，保存后重启/重载。
+之后在「插件商店」里可以安装或更新 `raccoon2api`；版本以 GitHub 最新 Release 的 tag 为准
+（`v0.1.0`），registry 不需要为每次发版改动。
+
+商店资产命名规则：
+
+- `raccoon2api_<version>_linux_amd64.zip`
+- `raccoon2api_<version>_linux_arm64.zip`
+- `raccoon2api_<version>_windows_amd64.zip`
+- `checksums.txt`
+
+每个 zip 的根目录只有对应平台的 `raccoon2api.so` / `raccoon2api.dll`，不要嵌套目录。
+registry 本身维护在 [JustCnc/cpa_plugins](https://github.com/JustCnc/cpa_plugins)，后续其他插件也加在同一个
+`registry.json` 的 `plugins` 数组里。
 
 ## 控制台
 

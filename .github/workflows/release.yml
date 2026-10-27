@@ -1,4 +1,4 @@
-name: Release Linux shared library
+name: Release plugin assets
 
 on:
   release:
@@ -20,9 +20,9 @@ concurrency:
 
 jobs:
   release:
-    name: Build and publish Linux .so
+    name: Build and publish plugin binaries
     # Ubuntu 22.04 keeps the glibc baseline older than ubuntu-latest (24.04),
-    # so the resulting shared library loads on more CPA hosts.
+    # so the resulting Linux shared libraries load on more CPA hosts.
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
@@ -46,19 +46,26 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install cross compiler
+      - name: Install cross compilers and zip
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            gcc gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+            gcc \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+            gcc-mingw-w64-x86-64 \
+            zip unzip
 
       - name: Run tests
         run: CGO_ENABLED=0 go test ./...
 
-      - name: Build Linux .so (amd64 + arm64)
+      - name: Build plugin binaries
         run: |
           set -euo pipefail
-          mkdir -p dist/plugins/linux/amd64 dist/plugins/linux/arm64
+          mkdir -p \
+            dist/plugins/linux/amd64 \
+            dist/plugins/linux/arm64 \
+            dist/plugins/windows/amd64
 
           CGO_ENABLED=1 GOOS=linux GOARCH=amd64 CC=gcc \
             go build -buildmode=c-shared -trimpath -ldflags='-s -w' \
@@ -68,18 +75,27 @@ jobs:
             go build -buildmode=c-shared -trimpath -ldflags='-s -w' \
             -o dist/plugins/linux/arm64/raccoon2api.so .
 
-          rm -f dist/plugins/linux/*/raccoon2api.h
+          CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc \
+            go build -buildmode=c-shared -trimpath -ldflags='-s -w' \
+            -o dist/plugins/windows/amd64/raccoon2api.dll .
 
-          for so in dist/plugins/linux/*/raccoon2api.so; do
-            echo "== $so"
-            file "$so"
+          rm -f dist/plugins/linux/*/raccoon2api.h dist/plugins/windows/*/raccoon2api.h
+
+          for bin in \
+            dist/plugins/linux/amd64/raccoon2api.so \
+            dist/plugins/linux/arm64/raccoon2api.so \
+            dist/plugins/windows/amd64/raccoon2api.dll; do
+            echo "== $bin"
+            file "$bin"
           done
 
           # Do not use grep -q with pipefail: grep may close the pipe early and
-          # make nm die with SIGPIPE even though the symbol is present.
+          # make nm/objdump die with SIGPIPE even though the symbol is present.
           nm -D --defined-only dist/plugins/linux/amd64/raccoon2api.so \
             | grep -E 'cliproxyPlugin(Call|Free|Shutdown)$' >/dev/null
           aarch64-linux-gnu-nm -D --defined-only dist/plugins/linux/arm64/raccoon2api.so \
+            | grep -E 'cliproxyPlugin(Call|Free|Shutdown)$' >/dev/null
+          x86_64-w64-mingw32-objdump -p dist/plugins/windows/amd64/raccoon2api.dll \
             | grep -E 'cliproxyPlugin(Call|Free|Shutdown)$' >/dev/null
 
       - name: Package release assets
@@ -89,14 +105,31 @@ jobs:
           VERSION="${VERSION//\//-}"
           test -n "$VERSION"
 
+          if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "::error::release tag $TAG must be v<dotted-numeric> for the plugin store"
+            exit 1
+          fi
+
+          PLUGIN_ID=raccoon2api
+          PROVIDER_KEY=$(sed -n 's/.*providerKey *= *"\([^"]*\)".*/\1/p' schema.go | head -1)
           PLUGIN_VERSION=$(sed -n 's/.*pluginVersion = "\([^"]*\)".*/\1/p' schema.go | head -1)
-          if [ -n "$PLUGIN_VERSION" ] && [ "$PLUGIN_VERSION" != "$VERSION" ]; then
-            echo "::warning::tag $TAG does not match pluginVersion $PLUGIN_VERSION"
+
+          if [ "$PROVIDER_KEY" != "$PLUGIN_ID" ]; then
+            echo "::error::providerKey '$PROVIDER_KEY' does not match store id '$PLUGIN_ID'"
+            exit 1
+          fi
+          if [ -z "$PLUGIN_VERSION" ] || [ "$PLUGIN_VERSION" != "$VERSION" ]; then
+            echo "::error::tag $TAG does not match pluginVersion '$PLUGIN_VERSION'; bump schema.go before releasing"
+            exit 1
           fi
 
           STAGE="dist/stage/raccoon2api-$VERSION"
-          rm -rf "$STAGE" dist/release
-          mkdir -p "$STAGE/plugins/linux/amd64" "$STAGE/plugins/linux/arm64" dist/release
+          RELEASE_DIR="$PWD/dist/release"
+          rm -rf "$STAGE" "$RELEASE_DIR"
+          mkdir -p \
+            "$STAGE/plugins/linux/amd64" \
+            "$STAGE/plugins/linux/arm64" \
+            "$RELEASE_DIR"
 
           cp dist/plugins/linux/amd64/raccoon2api.so "$STAGE/plugins/linux/amd64/"
           cp dist/plugins/linux/arm64/raccoon2api.so "$STAGE/plugins/linux/arm64/"
@@ -116,16 +149,43 @@ jobs:
           cp dist/plugins/linux/arm64/raccoon2api.so "dist/release/raccoon2api-$VERSION-linux-arm64.so"
           tar -C dist/stage -czf "dist/release/raccoon2api-$VERSION-linux.tar.gz" "raccoon2api-$VERSION"
 
+          # CPA plugin store assets. The library must be at the zip root and
+          # keep the plugin id as its filename.
           (
-            cd dist/release
-            sha256sum ./*.so ./*.tar.gz > SHA256SUMS
+            cd dist/plugins/linux/amd64
+            zip -q -j "$RELEASE_DIR/${PLUGIN_ID}_${VERSION}_linux_amd64.zip" raccoon2api.so
           )
-          ls -lh dist/release
+          (
+            cd dist/plugins/linux/arm64
+            zip -q -j "$RELEASE_DIR/${PLUGIN_ID}_${VERSION}_linux_arm64.zip" raccoon2api.so
+          )
+          (
+            cd dist/plugins/windows/amd64
+            zip -q -j "$RELEASE_DIR/${PLUGIN_ID}_${VERSION}_windows_amd64.zip" raccoon2api.dll
+          )
+
+          (
+            cd "$RELEASE_DIR"
+            sha256sum ./*.so ./*.tar.gz ./*.zip > SHA256SUMS
+            sha256sum "${PLUGIN_ID}_"*.zip > checksums.txt
+          )
+
+          for z in "$RELEASE_DIR"/*.zip; do
+            echo "== $z"
+            unzip -l "$z"
+            count=$(unzip -Z1 "$z" | grep -E '\.(so|dll|dylib)$' | wc -l || true)
+            if [ "$count" -ne 1 ]; then
+              echo "::error::$z must contain exactly one dynamic library at its root"
+              exit 1
+            fi
+          done
+
+          ls -lh "$RELEASE_DIR"
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: raccoon2api-${{ github.event.release.tag_name || github.event.inputs.tag }}-linux
+          name: raccoon2api-${{ github.event.release.tag_name || github.event.inputs.tag }}-assets
           path: dist/release/*
           if-no-files-found: error
 
@@ -192,7 +252,9 @@ jobs:
           gh release upload "$TAG" \
             dist/release/*.so \
             dist/release/*.tar.gz \
+            dist/release/*.zip \
             dist/release/SHA256SUMS \
+            dist/release/checksums.txt \
             dist/release/RELEASE_NOTES.md \
             --clobber
 
@@ -203,10 +265,10 @@ jobs:
           {
             echo "## Release ${TAG:-unknown}"
             echo
-            if ls dist/release/*.so dist/release/*.tar.gz >/dev/null 2>&1; then
+            if ls dist/release/*.so dist/release/*.tar.gz dist/release/*.zip >/dev/null 2>&1; then
               echo "| Asset | Size |"
               echo "| --- | --- |"
-              for f in dist/release/*.so dist/release/*.tar.gz; do
+              for f in dist/release/*.so dist/release/*.tar.gz dist/release/*.zip; do
                 echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"
               done
               echo
